@@ -9,19 +9,24 @@ import com.example.testredis.service.ProductService;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.redisson.api.RBloomFilter;
+import org.redisson.api.RLock;
 import org.redisson.api.RedissonClient;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.cache.Cache;
+import org.springframework.cache.CacheManager;
 import org.springframework.cache.annotation.CacheEvict;
 import org.springframework.cache.annotation.CachePut;
 import org.springframework.cache.annotation.Cacheable;
 import org.springframework.cache.annotation.Caching;
-import org.springframework.context.ApplicationEventPublisher;
 import org.springframework.context.annotation.Lazy;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.Pageable;
-import org.springframework.data.redis.core.RedisTemplate;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
+import org.springframework.transaction.support.TransactionSynchronization;
+import org.springframework.transaction.support.TransactionSynchronizationManager;
+
+import java.util.concurrent.TimeUnit;
 
 @Service
 @Transactional(readOnly = true)
@@ -34,10 +39,12 @@ public class ProductServiceImpl implements ProductService {
     @Autowired
     private ProductService self;
 
+    private static final String DETAIL_CACHE = "product-detail";
+
     private final ProductRepository productRepository;
     private final RedissonClient redissonClient;
     private final RBloomFilter<Long> productBloomFilter;
-    private final RedisTemplate<String, Object> redisTemplate;
+    private final CacheManager cacheManager;
 
 
     @Override
@@ -61,38 +68,62 @@ public class ProductServiceImpl implements ProductService {
     @Override
     @Cacheable(value = "product-detail", key = "#id")
     public ProductResponse getProduct(Long id) {
-
-        // Kiem tra nhanh qua Bloom Filter
+        // 1. Chặn nhanh qua Bloom Filter
         if (!productBloomFilter.contains(id)) {
-            return null; // Chan cache penetration
+            return null;
         }
 
-        // neu Bloom filter bao co the ton tai -> tiep tuc tra cuu Db
-        return productRepository.findById(id)
-                .map(this::maptoResponse)
-                .orElse(null);
-
+        // 2. Distributed Lock chống nhiều request cùng xuyên qua DB khi cache miss
+        RLock lock = redissonClient.getLock("lock:product:" + id);
+        boolean locked = false;
+        try {
+            locked = lock.tryLock(3, 10, TimeUnit.SECONDS);
+            if (locked) {
+                // Double-check cache phòng trường hợp luồng trước vừa nạp xong
+                Cache cache = cacheManager.getCache(DETAIL_CACHE);
+                if (cache != null) {
+                    Cache.ValueWrapper wrapper = cache.get(id);
+                    if (wrapper != null) {
+                        return (ProductResponse) wrapper.get();
+                    }
+                }
+            }
+            return productRepository.findById(id)
+                    .map(this::mapToResponse)
+                    .orElse(null);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return productRepository.findById(id)
+                    .map(this::mapToResponse)
+                    .orElse(null);
+        } finally {
+            if (locked && lock.isHeldByCurrentThread()) {
+                lock.unlock();
+            }
+        }
     }
 
-    private ProductResponse maptoResponse(ProductEntity entity) {
+    private ProductResponse mapToResponse(ProductEntity entity) {
         return new ProductResponse(
                 entity.getId(),
                 entity.getName(),
                 entity.getDescription(),
                 entity.getPrice(),
                 entity.getCategoryId(),
-                entity.getStock());
+                entity.getStock()
+        );
     }
 
     @Override
     @Transactional
     @Caching(evict = {
-            @CacheEvict(value = "product-detail", key = "#id"),
+            @CacheEvict(value = "product-detail", key = "#productId"),
             @CacheEvict(value = "product-list", allEntries = true)
     })
     public Void deleteProduct(Long productId) {
-        ProductEntity entity = productRepository.findById(productId)
-                .orElseThrow(() -> new RuntimeException("Product not found"));
+        if (!productRepository.existsById(productId)) {
+            throw new RuntimeException("Product not found");
+        }
         productRepository.deleteById(productId);
         return null;
     }
@@ -108,16 +139,23 @@ public class ProductServiceImpl implements ProductService {
                 .categoryId(productRequest.categoryId())
                 .stock(productRequest.stock())
                 .build();
-        productRepository.save(entity);
-        // Bắn event mang ID vừa sinh ra (ví dụ: 1005)
-        productBloomFilter.add(entity.getId());
-        log.info("Da them ID {} vao Bloom Filter", entity.getId());
+        ProductEntity saved = productRepository.save(entity);
+        Long savedId = saved.getId();
 
-        // 2. Xóa cache 'null' (nếu trước đó từng có ai query ID này và bị cache null)
-        String cacheKey = "product:" + entity.getId();
-        redisTemplate.delete(cacheKey);
+        // Chỉ cập nhật BloomFilter và xóa NullValue cache SAU KHI DB đã commit thành công
+        TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
+            @Override
+            public void afterCommit() {
+                productBloomFilter.add(savedId);
+                Cache detailCache = cacheManager.getCache(DETAIL_CACHE);
+                if (detailCache != null) {
+                    detailCache.evict(savedId); // Xóa đúng key "product-detail::<savedId>"
+                }
+                log.info("After commit: Đã nạp ID {} vào BloomFilter và evict null cache", savedId);
+            }
+        });
 
-        return maptoResponse(entity);
+        return mapToResponse(saved);
     }
 
 
