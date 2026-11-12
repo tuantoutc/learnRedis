@@ -3,6 +3,7 @@ package com.example.testredis.config;
 
 import com.fasterxml.jackson.annotation.JsonTypeInfo;
 import com.fasterxml.jackson.databind.DeserializationFeature;
+import com.fasterxml.jackson.databind.JavaType;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.jsontype.BasicPolymorphicTypeValidator;
 import com.fasterxml.jackson.databind.jsontype.PolymorphicTypeValidator;
@@ -51,14 +52,34 @@ public class RedisConfig {
         objectMapper.registerModule(new JavaTimeModule());
         objectMapper.configure(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES, false);
 
-        // Bắt buộc đăng ký để serialize/deserialize singleton NullValue của Spring Cache
-        GenericJackson2JsonRedisSerializer.registerNullValueSerializer(objectMapper, null);
-
         // Cho phép thêm type metadata cho record và final classes
         PolymorphicTypeValidator ptv = BasicPolymorphicTypeValidator.builder()
                 .allowIfBaseType(Object.class)
                 .build();
-        objectMapper.activateDefaultTyping(ptv, ObjectMapper.DefaultTyping.EVERYTHING, JsonTypeInfo.As.PROPERTY);
+
+        // Thay thế DefaultTyping.EVERYTHING để ép Jackson gắn @class cho Java Record
+        ObjectMapper.DefaultTypeResolverBuilder typeResolver = new ObjectMapper.DefaultTypeResolverBuilder(
+                ObjectMapper.DefaultTyping.NON_FINAL, ptv) {
+            @Override
+            public boolean useForType(JavaType t) {
+                if (t.isPrimitive()) {
+                    return false;
+                }
+                if (t.isRecordType()) {
+                    return true;
+                }
+                return super.useForType(t);
+            }
+        };
+        typeResolver.init(JsonTypeInfo.Id.CLASS, null);
+        typeResolver.inclusion(JsonTypeInfo.As.PROPERTY);
+        typeResolver.typeProperty("@class");
+        objectMapper.setDefaultTyping(typeResolver);
+
+        // Bắt buộc đăng ký để serialize/deserialize singleton NullValue của Spring Cache
+        GenericJackson2JsonRedisSerializer.registerNullValueSerializer(objectMapper, "@class");
+
+//        objectMapper.activateDefaultTyping(ptv, ObjectMapper.DefaultTyping.EVERYTHING , JsonTypeInfo.As.PROPERTY);
 
         GenericJackson2JsonRedisSerializer serializer = new GenericJackson2JsonRedisSerializer(objectMapper);
 
