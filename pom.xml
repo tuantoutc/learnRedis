@@ -36,6 +36,12 @@
             <groupId>org.springframework.boot</groupId>
             <artifactId>spring-boot-starter-data-redis</artifactId>
         </dependency>
+        <!--  Use redisson to solve Cache Penetration -->
+        <dependency>
+            <groupId>org.redisson</groupId>
+            <artifactId>redisson-spring-boot-starter</artifactId>
+            <version>3.45.0</version>
+        </dependency>
 
         <!-- 2. Làm việc với PostgreSQL qua Spring Data JPA (Hibernate) -->
         <dependency>

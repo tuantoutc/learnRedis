@@ -56,4 +56,11 @@ public class ProductController {
         return ApiResponse.success("Product deleted");
     }
 
+    @PostMapping("")
+    public ApiResponse<ProductResponse> addProduct(@Valid @RequestBody ProductRequest productRequest) {
+
+        return ApiResponse.success(productService.addProduct( productRequest));
+    }
+
+
 }

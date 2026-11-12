@@ -7,20 +7,26 @@ import com.example.testredis.domain.record.ProductResponse;
 import com.example.testredis.repository.ProductRepository;
 import com.example.testredis.service.ProductService;
 import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.redisson.api.RBloomFilter;
+import org.redisson.api.RedissonClient;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.cache.annotation.CacheEvict;
 import org.springframework.cache.annotation.CachePut;
 import org.springframework.cache.annotation.Cacheable;
 import org.springframework.cache.annotation.Caching;
+import org.springframework.context.ApplicationEventPublisher;
 import org.springframework.context.annotation.Lazy;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.Pageable;
+import org.springframework.data.redis.core.RedisTemplate;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
 @Service
 @Transactional(readOnly = true)
 @RequiredArgsConstructor
+@Slf4j
 public class ProductServiceImpl implements ProductService {
 
 
@@ -29,6 +35,10 @@ public class ProductServiceImpl implements ProductService {
     private ProductService self;
 
     private final ProductRepository productRepository;
+    private final RedissonClient redissonClient;
+    private final RBloomFilter<Long> productBloomFilter;
+    private final RedisTemplate<String, Object> redisTemplate;
+
 
     @Override
     @Cacheable(
@@ -51,6 +61,13 @@ public class ProductServiceImpl implements ProductService {
     @Override
     @Cacheable(value = "product-detail", key = "#id")
     public ProductResponse getProduct(Long id) {
+
+        // Kiem tra nhanh qua Bloom Filter
+        if (!productBloomFilter.contains(id)) {
+            return null; // Chan cache penetration
+        }
+
+        // neu Bloom filter bao co the ton tai -> tiep tuc tra cuu Db
         return productRepository.findById(id)
                 .map(this::maptoResponse)
                 .orElse(null);
@@ -92,13 +109,15 @@ public class ProductServiceImpl implements ProductService {
                 .stock(productRequest.stock())
                 .build();
         productRepository.save(entity);
-        return new ProductResponse(
-                entity.getId(),
-                entity.getName(),
-                entity.getDescription(),
-                entity.getPrice(),
-                entity.getCategoryId(),
-                entity.getStock());
+        // Bắn event mang ID vừa sinh ra (ví dụ: 1005)
+        productBloomFilter.add(entity.getId());
+        log.info("Da them ID {} vao Bloom Filter", entity.getId());
+
+        // 2. Xóa cache 'null' (nếu trước đó từng có ai query ID này và bị cache null)
+        String cacheKey = "product:" + entity.getId();
+        redisTemplate.delete(cacheKey);
+
+        return maptoResponse(entity);
     }
 
 
