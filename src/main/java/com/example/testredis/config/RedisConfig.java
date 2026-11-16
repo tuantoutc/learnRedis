@@ -8,7 +8,6 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.jsontype.BasicPolymorphicTypeValidator;
 import com.fasterxml.jackson.databind.jsontype.PolymorphicTypeValidator;
 import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
-import org.redisson.spring.cache.NullValue;
 import org.springframework.cache.annotation.EnableCaching;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
@@ -22,6 +21,8 @@ import org.springframework.data.redis.serializer.Jackson2JsonRedisSerializer;
 import org.springframework.data.redis.serializer.RedisSerializationContext;
 import org.springframework.data.redis.serializer.StringRedisSerializer;
 
+
+import org.springframework.cache.support.NullValue;
 import java.time.Duration;
 import java.util.Map;
 
@@ -89,13 +90,13 @@ public class RedisConfig {
 
         // NullValue chỉ giữ 30 giây, dữ liệu thật giữ 10 phút
         RedisCacheConfiguration productDetailConfig = baseConfig.entryTtl((key, value) ->
-                (value == null || value instanceof NullValue) ? Duration.ofSeconds(30) : Duration.ofMinutes(10)
+                (value == null || value instanceof NullValue) ? Duration.ofSeconds(30) : Duration.ofMinutes(1)
         );
 
         RedisCacheConfiguration productListConfig = baseConfig.entryTtl(Duration.ofMinutes(5));
 
         return RedisCacheManager.builder(connectionFactory)
-                .cacheDefaults(baseConfig.entryTtl(Duration.ofMinutes(10)))
+                .cacheDefaults(baseConfig.entryTtl(Duration.ofMinutes(1)))
                 .withInitialCacheConfigurations( Map.of(
                         "product-detail", productDetailConfig,
                         "product-list", productListConfig

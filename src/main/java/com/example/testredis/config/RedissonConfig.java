@@ -20,8 +20,8 @@ public class RedissonConfig {
         Config config = new Config();
         config.useSingleServer()
                 .setAddress("redis://" + redisHost + ":" + redisPort)
-                .setConnectionMinimumIdleSize(5)      // Duy trì tối thiểu 5 kết nối nhàn rỗi
-                .setConnectionPoolSize(20)            // Sửa lại thành SET: Tối đa 20 kết nối đồng thời
+                .setConnectionMinimumIdleSize(24)      // Duy trì tối thiểu 5 kết nối nhàn rỗi
+                .setConnectionPoolSize(128)            // Sửa lại thành SET: Tối đa 20 kết nối đồng thời
                 .setConnectTimeout(5000)              // Timeout khi tạo kết nối (5s)
                 .setTimeout(3000);
         return Redisson.create(config);
