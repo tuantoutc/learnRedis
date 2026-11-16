@@ -6,11 +6,10 @@ import com.example.testredis.domain.record.ProductRequest;
 import com.example.testredis.domain.record.ProductResponse;
 import com.example.testredis.repository.ProductRepository;
 import com.example.testredis.service.ProductService;
+import com.example.testredis.utils.CacheAsideExecutor;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.redisson.api.RBloomFilter;
-import org.redisson.api.RLock;
-import org.redisson.api.RedissonClient;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.cache.Cache;
 import org.springframework.cache.CacheManager;
@@ -26,9 +25,6 @@ import org.springframework.transaction.annotation.Transactional;
 import org.springframework.transaction.support.TransactionSynchronization;
 import org.springframework.transaction.support.TransactionSynchronizationManager;
 
-
-import java.util.concurrent.TimeUnit;
-
 @Service
 @Transactional(readOnly = true)
 @RequiredArgsConstructor
@@ -43,9 +39,10 @@ public class ProductServiceImpl implements ProductService {
     private static final String DETAIL_CACHE = "product-detail";
 
     private final ProductRepository productRepository;
-    private final RedissonClient redissonClient;
     private final RBloomFilter<Long> productBloomFilter;
     private final CacheManager cacheManager;
+
+    private final CacheAsideExecutor executor;
 
 
     @Override
@@ -68,59 +65,75 @@ public class ProductServiceImpl implements ProductService {
 
     @Override
     public ProductResponse getProduct(Long id) {
-        Cache cache = cacheManager.getCache(DETAIL_CACHE);
+//        Cache cache = cacheManager.getCache(DETAIL_CACHE);
+//
+////         1. Đọc Cache lần 1 (wrapper != null nghĩa là đã có key, kể cả khi giá trị bên trong là null)
+//        Cache.ValueWrapper hit = getFromCache(cache, id);
+//        if (hit != null) {
+//            return (ProductResponse) hit.get();
+//        }
+//
+//        // 2. Chặn nhanh qua Bloom Filter
+//        if (!productBloomFilter.contains(id)) {
+//            return null;
+//        }
+//
+//        // 3. Distributed Lock chống nhiều request cùng xuyên qua DB khi cache miss
+//        RLock lock = redissonClient.getLock("lock:product:" + id);
+//        boolean locked = false;
+//        try {
+//            locked = lock.tryLock(3, 10, TimeUnit.SECONDS);
+//            if (!locked) {
+//                // Hết 3s chờ khóa: thử đọc lại cache lần cuối, tuyệt đối KHÔNG query DB                Cache cache = cacheManager.getCache(DETAIL_CACHE);
+//                Cache.ValueWrapper retryHit = getFromCache(cache, id);
+//                if (retryHit != null) {
+//                    return (ProductResponse) retryHit.get();
+//                }
+//                throw new IllegalStateException("Hệ thống đang quá tải, vui lòng thử lại sau.");
+//            }
+//            // 4. Double-check cache sau khi chiếm được khóa
+//            Cache.ValueWrapper doubleCheckHit = getFromCache(cache, id);
+//            if (doubleCheckHit != null) {
+//                return (ProductResponse) doubleCheckHit.get();
+//            }
+//            // 5. Thực sự miss -> Query DB
+//            ProductResponse response = productRepository.findById(id)
+//                    .map(this::mapToResponse)
+//                    .orElse(null);
+//
+//            // 6. Ghi vào Redis TRƯỚC KHI nhả khóa ở khối finally
+//            // Nếu response == null, Spring RedisCache tự bọc thành NullValue (TTL 30s)
+//            if (cache != null) {
+//                cache.put(id, response);
+//            }
+//            return response;
+//        } catch (InterruptedException e) {
+//            Thread.currentThread().interrupt();
+//            throw new IllegalStateException("Luồng xử lý bị gián đoạn", e);
+//        } finally {
+//            if (locked && lock.isHeldByCurrentThread()) {
+//                lock.unlock();
+//            }
+//        }
 
-//         1. Đọc Cache lần 1 (wrapper != null nghĩa là đã có key, kể cả khi giá trị bên trong là null)
-        Cache.ValueWrapper hit = getFromCache(cache, id);
-        if(hit != null) {
-            return (ProductResponse) hit.get();
-        }
-
-        // 2. Chặn nhanh qua Bloom Filter
+        // chặn nhanh cac id ko ton tai qua bloom filter
         if (!productBloomFilter.contains(id)) {
             return null;
         }
 
-        // 3. Distributed Lock chống nhiều request cùng xuyên qua DB khi cache miss
-        RLock lock = redissonClient.getLock("lock:product:" + id);
-        boolean locked = false;
-        try {
-            locked = lock.tryLock(3, 10, TimeUnit.SECONDS);
-            if (!locked) {
-                // Hết 3s chờ khóa: thử đọc lại cache lần cuối, tuyệt đối KHÔNG query DB                Cache cache = cacheManager.getCache(DETAIL_CACHE);
-                Cache.ValueWrapper retryHit = getFromCache(cache,id);
-                if(retryHit != null) {
-                    return (ProductResponse) retryHit.get();
-                }
-                throw new IllegalStateException("Hệ thống đang quá tải, vui lòng thử lại sau.");
-            }
-            // 4. Double-check cache sau khi chiếm được khóa
-            Cache.ValueWrapper doubleCheckHit = getFromCache(cache,id);
-            if(doubleCheckHit != null) {
-                return (ProductResponse) doubleCheckHit.get();
-            }
-            // 5. Thực sự miss -> Query DB
-            ProductResponse response = productRepository.findById(id)
-                    .map(this::mapToResponse)
-                    .orElse(null);
-
-            // 6. Ghi vào Redis TRƯỚC KHI nhả khóa ở khối finally
-            // Nếu response == null, Spring RedisCache tự bọc thành NullValue (TTL 30s)
-            if (cache != null) {
-                cache.put(id, response);
-            }
-            return response;
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            throw new IllegalStateException("Luồng xử lý bị gián đoạn", e);
-        } finally {
-            if (locked && lock.isHeldByCurrentThread()) {
-                lock.unlock();
-            }
-        }
+        // goi CacheAsideExecutor xu ly tron goi cache + distributed lock + db fallback
+        return executor.execute(
+                DETAIL_CACHE,
+                id,
+                ProductResponse.class,
+                () -> productRepository
+                        .findById(id)
+                        .map(this::mapToResponse)
+                        .orElse(null)
+        );
     }
 
-    private Cache.ValueWrapper getFromCache(Cache cache,Long id) {
+    private Cache.ValueWrapper getFromCache(Cache cache, Long id) {
         return cache != null ? cache.get(id) : null;
     }
 
