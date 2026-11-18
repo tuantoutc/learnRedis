@@ -1,5 +1,6 @@
 package com.example.testredis.service.impl;
 
+import com.example.testredis.domain.entity.ProductEntity;
 import com.example.testredis.domain.record.FlashSaleRequest;
 import com.example.testredis.domain.record.FlashSaleResponse;
 import com.example.testredis.repository.ProductRepository;
@@ -7,14 +8,15 @@ import com.example.testredis.service.FlashSaleService;
 import com.example.testredis.service.ProductService;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.redisson.api.RLock;
+import org.redisson.api.RedissonClient;
 import org.springframework.cache.Cache;
 import org.springframework.cache.CacheManager;
 import org.springframework.stereotype.Service;
-import org.springframework.transaction.annotation.Transactional;
-import org.springframework.transaction.support.TransactionSynchronization;
-import org.springframework.transaction.support.TransactionSynchronizationManager;
+import org.springframework.transaction.support.TransactionTemplate;
 
 import java.time.LocalDateTime;
+import java.util.concurrent.TimeUnit;
 
 
 @Service
@@ -26,39 +28,81 @@ public class FlashSaleServiceImpl implements FlashSaleService {
     private final ProductService productService;
     private final CacheManager cacheManager;
 
+    private final RedissonClient redissonClient;
+    private final TransactionTemplate transactionTemplate;
+
     @Override
-    @Transactional
     public FlashSaleResponse sale(FlashSaleRequest request) {
 
-        // Trừ kho nguyên tử trực tiếp dưới DB: chỉ trừ khi stock >= quantity
-        int updatedRows = productRepository.decreaseStock(request.productId(), request.quantity());
-
-        if (updatedRows == 0) {
-            return new FlashSaleResponse(
-                    request,
-                    "Sản phẩm không tồn tại hoặc không đủ số lượng tồn kho",
-                    LocalDateTime.now()
-            );
-        }
-        // Evict cache sau khi transactional commit thành công tránh stale data
-        TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
-            @Override
-            public void afterCommit() {
-                Cache detailCache = cacheManager.getCache("product-detail");
-                if(detailCache != null) {
-                    detailCache.evict(request.productId());
-                }
-                Cache listCache = cacheManager.getCache("product-list");
-                if(listCache != null) {
-                    listCache.clear();
-                }
+        // Set key lock different lock read cache ProductServiceImpl ("lock:product:" vs "lock:flash-sale")
+        String lockKey = "lock:flash-sale:product" + request.productId();
+        RLock lock = redissonClient.getLock(lockKey);
+        boolean isLocked = false;
+        try{
+            // wait max 5 seconds to get lock
+            // note: Dont send leaseTime ( or sent -1) to active Watchdog auto reset lock if db low processing
+            isLocked = lock.tryLock(5, TimeUnit.SECONDS);
+            if(!isLocked){
+                return new FlashSaleResponse(
+                        request,
+                        "Hệ thống đang bận xử lý đơn hàng khác, vui lòng thử lại sau",
+                        LocalDateTime.now()
+                );
             }
-        });
-        return new FlashSaleResponse(
-                request,
-                "Da mua thanh cong "+ request.quantity()+" san pham",
-                LocalDateTime.now()
-        );
+            // 2.Open Transaction in LOCK
+            FlashSaleResponse flashSaleResponse = transactionTemplate.execute(status -> {
+                // read latest stock vale  from db
+                ProductEntity productEntity = productRepository.findById(request.productId())
+                        .orElse(null);
+                if(productEntity == null){
+                    return new FlashSaleResponse(request, "Không có sản phẩm này trong dữ liệu", LocalDateTime.now());
+                }
+                if(productEntity.getStock() <= 0) {
+                    return new FlashSaleResponse(request, "Không mua được gì cả do hết hàng", LocalDateTime.now());
+                }
+                // send notify when stock <  request quantity
+                if(request.quantity() > productEntity.getStock()) {
+                    return new FlashSaleResponse(
+                            request,
+                            "Kho chỉ còn" + productEntity.getStock() + " sản phẩm, không đủ số lượng bạn đặt",
+                            LocalDateTime.now());
+                }
+                long newStock = productEntity.getStock() - request.quantity();
+                productEntity.setStock(newStock);
+                productRepository.save(productEntity);
+                return new FlashSaleResponse(
+                        request,
+                        "Da mua thanh cong",
+                        LocalDateTime.now()
+                );
+            });
+
+            //3 Transaction had committed -> process clean cache ( safe because get lock all time)
+            evictProductCache(request.productId());
+            return flashSaleResponse;
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            log.error("Luồng mua hàng bị ngắt quãng cho productId={}", request.productId(), e);
+            return new FlashSaleResponse(request, "Lỗi hệ thống khi xử lý giao dịch", LocalDateTime.now());
+        }
+        finally {
+            // 4. Chỉ nhả lock sau khi DB đã commit và Cache đã được dọn dẹp
+            if (isLocked && lock.isHeldByCurrentThread()) {
+                lock.unlock();
+            }
+        }
+
+    }
+
+    private void evictProductCache(Long productId) {
+        Cache cache = cacheManager.getCache("product-detail");
+        if(cache != null){
+            cache.evict(productId);
+        }
+        Cache cacheList = cacheManager.getCache("product-list");
+        if(cacheList != null){
+            cacheList.clear();
+        }
     }
 
     @Override
