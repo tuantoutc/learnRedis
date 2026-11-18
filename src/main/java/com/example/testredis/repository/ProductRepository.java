@@ -3,6 +3,7 @@ package com.example.testredis.repository;
 import com.example.testredis.domain.entity.ProductEntity;
 import org.springframework.data.domain.Pageable;
 import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.data.jpa.repository.Modifying;
 import org.springframework.data.jpa.repository.Query;
 import org.springframework.data.repository.query.Param;
 import org.springframework.stereotype.Repository;
@@ -14,4 +15,8 @@ public interface ProductRepository extends JpaRepository<ProductEntity, Long> {
 
     @Query("SELECT p.id FROM ProductEntity p WHERE p.id > :lastId ORDER BY p.id ASC")
     List<Long> findNextIds(@Param("lastId") Long lastId, Pageable pageable);
+
+    @Modifying
+    @Query("UPDATE ProductEntity p SET p.stock = p.stock - :qty WHERE p.id = :id AND p.stock >= :qty")
+    int decreaseStock(@Param("id") Long id, @Param("qty") Long qty);
 }
