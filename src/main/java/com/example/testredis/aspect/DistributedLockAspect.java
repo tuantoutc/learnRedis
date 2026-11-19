@@ -9,85 +9,105 @@ import org.aspectj.lang.annotation.Aspect;
 import org.aspectj.lang.reflect.MethodSignature;
 import org.redisson.api.RLock;
 import org.redisson.api.RedissonClient;
+import org.springframework.aop.support.AopUtils;
+import org.springframework.context.expression.MethodBasedEvaluationContext;
 import org.springframework.core.DefaultParameterNameDiscoverer;
-import org.springframework.core.Ordered;
+import org.springframework.core.ParameterNameDiscoverer;
 import org.springframework.core.annotation.Order;
 import org.springframework.expression.EvaluationContext;
+import org.springframework.expression.Expression;
 import org.springframework.expression.ExpressionParser;
 import org.springframework.expression.spel.standard.SpelExpressionParser;
-import org.springframework.expression.spel.support.StandardEvaluationContext;
 import org.springframework.stereotype.Component;
+import org.springframework.util.StringUtils;
 
 import java.lang.reflect.Method;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 
 @Slf4j
 @Aspect
 @Component
 @RequiredArgsConstructor
-@Order(Ordered.HIGHEST_PRECEDENCE) // BẮT BUỘC: Đảm bảo Lock bọc ngoài @Transactional
+@Order(1) // Chạy sau ExposeInvocationInterceptor nhưng vẫn bọc ngoài @Transactional (LOWEST_PRECEDENCE)
 public class DistributedLockAspect {
 
     private final RedissonClient redissonClient;
     private final ExpressionParser parser = new SpelExpressionParser();
-    private final DefaultParameterNameDiscoverer nameDiscoverer = new DefaultParameterNameDiscoverer();
+    private final ParameterNameDiscoverer nameDiscoverer = new DefaultParameterNameDiscoverer();
+    private final Map<String, Expression> expressionCache = new ConcurrentHashMap<>();
 
     @Around("@annotation(distributedLock)")
     public Object handleDistributedLock(ProceedingJoinPoint joinPoint, DistributedLock distributedLock) throws Throwable {
         MethodSignature signature = (MethodSignature) joinPoint.getSignature();
-        Method method = signature.getMethod();
-        Object[] args = joinPoint.getArgs();
+        Method targetMethod = AopUtils.getMostSpecificMethod(
+                signature.getMethod(),
+                joinPoint.getTarget().getClass()
+        );
 
-        // 1. Phân tích cú pháp SpEL để lấy tên Lock Key động
-        String lockKey = parseSpelKey(distributedLock.key(), method, args);
+        // 1. Phân tích SpEL để tạo Lock Key động và kiểm tra tính hợp lệ
+        String lockKey = parseSpelKey(distributedLock.key(), joinPoint.getTarget(), targetMethod, joinPoint.getArgs());
 
         // 2. Lấy đối tượng RLock từ RedissonClient
         RLock lock = redissonClient.getLock(lockKey);
         boolean isAcquired = false;
 
-        log.info("[DistributedLock] Đang thử xin Lock cho key: {} (Wait: {}s, Lease: {}s)",
-                lockKey, distributedLock.waitTime(), distributedLock.leaseTime());
+        log.debug("[DistributedLock] Đang thử xin Lock cho key: {} (Wait: {}, Lease: {}, Unit: {})",
+                lockKey, distributedLock.waitTime(), distributedLock.leaseTime(), distributedLock.timeUnit());
 
         try {
             // 3. Thử lấy khóa trong khoảng thời gian waitTime
-            isAcquired = lock.tryLock(distributedLock.waitTime(), distributedLock.leaseTime(), distributedLock.timeUnit());
+            isAcquired = lock.tryLock(
+                    distributedLock.waitTime(),
+                    distributedLock.leaseTime(),
+                    distributedLock.timeUnit()
+            );
 
             if (!isAcquired) {
                 log.warn("[DistributedLock] Không thể lấy Lock cho key: {}. Hệ thống đang quá tải!", lockKey);
                 throw new IllegalStateException("Hệ thống bận, vui lòng thử lại sau!");
             }
 
-            log.info("[DistributedLock] Lấy Lock thành công cho key: {}", lockKey);
+            log.debug("[DistributedLock] Lấy Lock thành công cho key: {}", lockKey);
 
-            // 4. Cho phép method gốc (business logic) được thực thi
+            // 4. Thực thi business logic (bên trong có thể có @Transactional)
             return joinPoint.proceed();
 
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            log.error("[DistributedLock] Luồng bị gián đoạn khi đang chờ Lock cho key: {}", lockKey, e);
+            throw new IllegalStateException("Yêu cầu bị gián đoạn khi chờ xử lý, vui lòng thử lại!", e);
         } finally {
-            // 5. Giải phóng khóa an toàn trong khối finally
+            // 5. Giải phóng khóa an toàn
             if (isAcquired && lock.isHeldByCurrentThread()) {
-                lock.unlock();
-                log.info("[DistributedLock] Đã giải phóng Lock thành công cho key: {}", lockKey);
+                try {
+                    lock.unlock();
+                    log.debug("[DistributedLock] Đã giải phóng Lock cho key: {}", lockKey);
+                } catch (IllegalMonitorStateException e) {
+                    log.warn("[DistributedLock] Lock cho key {} đã hết hạn hoặc bị giải phóng trước đó", lockKey, e);
+                }
             }
         }
     }
 
     /**
-     * Phương thức phân tích biểu thức SpEL (Spring Expression Language)
-     * để trích xuất giá trị tham số động (Ví dụ: "#productId" -> "101")
+     * Phân tích biểu thức SpEL với cache Expression và fallback sang tên method nếu key trống.
      */
-    private String parseSpelKey(String spelKey, Method method, Object[] args) {
-        if (spelKey == null || spelKey.trim().isEmpty()) {
-            return method.getName();
+    private String parseSpelKey(String spelKey, Object target, Method method, Object[] args) {
+        if (!StringUtils.hasText(spelKey)) {
+            return method.getDeclaringClass().getSimpleName() + ":" + method.getName();
         }
 
-        String[] parameterNames = nameDiscoverer.getParameterNames(method);
-        EvaluationContext context = new StandardEvaluationContext();
+        EvaluationContext context = new MethodBasedEvaluationContext(target, method, args, nameDiscoverer);
+        Expression expression = expressionCache.computeIfAbsent(spelKey, parser::parseExpression);
+        String lockKey = expression.getValue(context, String.class);
 
-        if (parameterNames != null) {
-            for (int i = 0; i < parameterNames.length; i++) {
-                context.setVariable(parameterNames[i], args[i]);
-            }
+        if (!StringUtils.hasText(lockKey)) {
+            throw new IllegalArgumentException(
+                    "Biểu thức SpEL '" + spelKey + "' trên method '" + method.getName() + "' trả về key rỗng hoặc null"
+            );
         }
 
-        return parser.parseExpression(spelKey).getValue(context, String.class);
+        return lockKey;
     }
 }

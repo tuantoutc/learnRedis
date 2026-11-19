@@ -6,21 +6,16 @@ import com.example.testredis.domain.record.FlashSaleRequest;
 import com.example.testredis.domain.record.FlashSaleResponse;
 import com.example.testredis.repository.ProductRepository;
 import com.example.testredis.service.FlashSaleService;
-import com.example.testredis.service.ProductService;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
-import org.redisson.api.RLock;
-import org.redisson.api.RedissonClient;
 import org.springframework.cache.Cache;
 import org.springframework.cache.CacheManager;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.transaction.support.TransactionSynchronization;
 import org.springframework.transaction.support.TransactionSynchronizationManager;
-import org.springframework.transaction.support.TransactionTemplate;
 
 import java.time.LocalDateTime;
-import java.util.concurrent.TimeUnit;
 
 
 @Service
@@ -29,11 +24,8 @@ import java.util.concurrent.TimeUnit;
 public class FlashSaleServiceImpl implements FlashSaleService {
 
     private final ProductRepository productRepository;
-    private final ProductService productService;
     private final CacheManager cacheManager;
 
-    private final RedissonClient redissonClient;
-    private final TransactionTemplate transactionTemplate;
 
 //    @Override
 //    public FlashSaleResponse sale(FlashSaleRequest request) {
@@ -98,14 +90,13 @@ public class FlashSaleServiceImpl implements FlashSaleService {
 //
 //    }
 
-
     @Override
     @DistributedLock(key = "'lock:flash_sale:' + #request.productId()", waitTime = 5, leaseTime = -1)
     @Transactional
     public FlashSaleResponse sale(FlashSaleRequest request) {
         ProductEntity productEntity = productRepository
                 .findById(request.productId())
-                    .orElse(null);
+                .orElse(null);
         if (productEntity == null) {
             return new FlashSaleResponse(request, "Không có sản phẩm này trong dữ liệu", LocalDateTime.now());
         }
@@ -135,11 +126,11 @@ public class FlashSaleServiceImpl implements FlashSaleService {
 
     private void evictProductCache(Long productId) {
         Cache cache = cacheManager.getCache("product-detail");
-        if(cache != null){
+        if (cache != null) {
             cache.evict(productId);
         }
         Cache cacheList = cacheManager.getCache("product-list");
-        if(cacheList != null){
+        if (cacheList != null) {
             cacheList.clear();
         }
     }
